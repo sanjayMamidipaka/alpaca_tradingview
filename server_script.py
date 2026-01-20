@@ -71,8 +71,9 @@ async def tradingview_webhook(request: Request):
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/health")
-async def health_check():
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health_check(response):
+    # This ensures the server resets its scale-to-zero timer
     return {"status": "ok"}
 
 if __name__ == "__main__":

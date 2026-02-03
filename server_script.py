@@ -1,7 +1,10 @@
 import os
+import math
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from alpaca.trading.client import TradingClient
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.common.exceptions import APIError
@@ -14,79 +17,97 @@ API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE")
 
-# Initialize Trading Client (set paper=False for live trading)
+# Initialize Clients
+# Paper=True for testing; set to False only when ready for Live
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+stock_data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 
 @app.post("/webhook")
 async def tradingview_webhook(request: Request):
-    # 1. Security: Passphrase Check
+    # 1. Security Check
     data = await request.json()
     if data.get("passphrase") != PASSPHRASE:
         raise HTTPException(status_code=401, detail="Invalid passphrase")
 
-    ticker = data.get("ticker", "DOGEUSD").replace("/", "")
+    ticker = data.get("ticker", "DOGEUSD").replace("/", "").upper()
     side_input = data.get("side", "").lower()
 
-    # Asset Check: Crypto vs Equities
+    # Asset Type Detection
     is_crypto = ticker.endswith("USD") or ticker.endswith("USDT")
     tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
 
     try:
-        # 2. POSITION CHECK: Get current position status
+        # 2. Position Check
         current_position = None
         try:
             current_position = trading_client.get_open_position(ticker)
         except APIError:
             current_position = None
 
-        # 3. SAFETY LOGIC: Close/Cover orders
+        # 3. Exit Logic: Close or Cover
         if side_input in ["sell", "buy_to_cover"]:
             if current_position is None:
-                print(
-                    f"IGNORING: No position found for {ticker} to close/cover.")
-                return {"status": "ignored", "message": "No open position to close"}
+                print(f"IGNORING: No position found for {ticker}.")
+                return {"status": "ignored", "message": "No open position"}
 
-            # Liquidate the position
-            print(f"Closing position for {ticker}...")
             trading_client.close_position(ticker)
             return {"status": "success", "message": f"Closed {ticker}"}
 
-        # 4. ENTRY LOGIC: Long (buy) or Short (sell_short)
+        # 4. Entry Logic: Buy or Short
         elif side_input in ["buy", "sell_short"]:
-            # PREVENT DOUBLE ENTRIES
             if current_position is not None:
-                print(f"SKIPPING: Position already open in {ticker}")
                 return {"status": "ignored", "message": "Position already open"}
 
-            # REJECT CRYPTO SHORTS: Alpaca does not support shorting crypto
             if side_input == "sell_short" and is_crypto:
-                return {"status": "error", "message": "Alpaca does not support shorting crypto"}
+                return {"status": "error", "message": "Shorting crypto is not supported on Alpaca"}
 
-            # Dynamic Risk Calculation
+            # Account & Risk Math
             account = trading_client.get_account()
             total_equity = float(account.equity)
-            risk_amount = total_equity * 0.11
-            notional_value = round(max(risk_amount, 11.00), 2)
+            risk_dollars = total_equity * 0.11
+            notional_target = max(risk_dollars, 11.00)
 
-            # Map signal to Alpaca OrderSide
-            alpaca_side = OrderSide.BUY if side_input == "buy" else OrderSide.SELL
+            # --- SHORTING FIX: Calculate whole shares ---
+            if side_input == "sell_short":
+                # Fetch latest price to avoid fractional order error
+                price_request = StockLatestTradeRequest(
+                    symbol_or_symbols=ticker)
+                latest_trade = stock_data_client.get_stock_latest_trade(
+                    price_request)
+                current_price = latest_trade[ticker].price
 
-            print(
-                f"Equity: {total_equity} | Notional: ${notional_value} | Side: {alpaca_side}")
+                # Calculate integer quantity (Whole shares only)
+                share_qty = math.floor(notional_target / current_price)
+
+                if share_qty < 1:
+                    return {"status": "error", "message": "Equity too low to short at least 1 whole share"}
+
+                order_request = MarketOrderRequest(
+                    symbol=ticker,
+                    qty=share_qty,
+                    side=OrderSide.SELL,
+                    time_in_force=tif
+                )
+                print(
+                    f"SHORTING {ticker}: {share_qty} shares at approx ${current_price}")
+
+            # --- LONG ENTRY: Uses Notional (Supports fractions) ---
+            else:
+                order_request = MarketOrderRequest(
+                    symbol=ticker,
+                    notional=round(notional_target, 2),
+                    side=OrderSide.BUY,
+                    time_in_force=tif
+                )
+                print(f"BUYING {ticker}: Notional ${notional_target}")
 
             # Submit Order
-            order = trading_client.submit_order(MarketOrderRequest(
-                symbol=ticker,
-                notional=notional_value,
-                side=alpaca_side,
-                time_in_force=tif
-            ))
-
-            return {"status": "success", "order_id": str(order.id), "side": str(alpaca_side)}
+            order = trading_client.submit_order(order_request)
+            return {"status": "success", "order_id": str(order.id)}
 
     except Exception as e:
-        print(f"ERROR: {str(e)}")
+        print(f"CRITICAL ERROR: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 

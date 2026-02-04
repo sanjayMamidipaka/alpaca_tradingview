@@ -3,6 +3,9 @@ import math
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from alpaca.trading.client import TradingClient
+from alpaca.data.historical import StockHistoricalDataClient  # <-- Added for data
+# <-- For quick price checks
+from alpaca.data.requests import StockSnapshotRequest
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.common.exceptions import APIError
@@ -15,8 +18,10 @@ API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE")
 
-# Initialize Trading Client only
+# Initialize Clients
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+data_client = StockHistoricalDataClient(
+    API_KEY, SECRET_KEY)  # <-- Replaces the "internal" check
 
 
 @app.post("/webhook")
@@ -32,7 +37,7 @@ async def tradingview_webhook(request: Request):
     tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
 
     try:
-        # 1. Position Check
+        # 1. Position Check (Prevents double-dipping as discussed)
         current_position = None
         try:
             current_position = trading_client.get_open_position(ticker)
@@ -46,7 +51,7 @@ async def tradingview_webhook(request: Request):
                 return {"status": "success", "message": f"Closed {ticker}"}
             return {"status": "ignored", "message": "No position to close"}
 
-        # 3. Entry Logic
+        # 3. Entry Logic (Volatility Washout Entry)
         elif side_input in ["buy", "sell_short"]:
             if current_position:
                 return {"status": "ignored", "message": "Position already open"}
@@ -56,41 +61,22 @@ async def tradingview_webhook(request: Request):
 
             # Risk Calculation
             account = trading_client.get_account()
+            # 11% risk per trade as per your requirement
             risk_dollars = float(account.equity) * 0.11
             target_value = max(risk_dollars, 11.00)
 
-            # --- SHORTING FIX (Whole Shares) ---
+            # --- DATA FETCHING FIX ---
+            # Using Snapshot to get the latest price for shorts or precise sizing
+            snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=[ticker]))
+            current_price = snapshot[ticker].latest_trade.price
+
             if side_input == "sell_short":
-                # Using TradingClient to get the latest quote for the ticker
-                # We pull the 'bid_price' to be conservative for a short entry
                 asset_data = trading_client.get_asset(ticker)
                 if not asset_data.shortable:
                     return {"status": "error", "message": f"{ticker} not shortable"}
 
-                # Note: Newer alpaca-py versions allow get_latest_quote on TradingClient
-                # or you can fetch the snapshot.
-                # If your version lacks this, we fallback to a simple price estimate
-                # or you can use the 'notional' for buys and 'qty' for shorts.
-
-                # To get price without StockHistoricalDataClient:
-                # We fetch a snapshot via a minimal order check or asset status.
-                # However, for 100% reliability, let's calculate QTY manually:
-
-                try:
-                    # This is the "internal" way to get a price via TradingClient
-                    # if you don't want to import the DataClient.
-                    latest_quote = trading_client.get_latest_stock_quote(
-                        ticker)
-                    price = latest_quote.bid_price
-                except:
-                    # Fallback if get_latest_stock_quote is not in your specific SDK version
-                    # Some versions require the DataClient.
-                    # If this errors, you MUST use DataClient or hardcode a price.
-                    raise Exception(
-                        "Unable to fetch price for shorting without DataClient.")
-
-                share_qty = math.floor(target_value / price)
-
+                # Shorting requires whole shares in many Alpaca account types
+                share_qty = math.floor(target_value / current_price)
                 if share_qty < 1:
                     return {"status": "error", "message": "Notional too low for 1 share"}
 
@@ -100,9 +86,8 @@ async def tradingview_webhook(request: Request):
                     side=OrderSide.SELL,
                     time_in_force=tif
                 ))
-
-            # --- LONG ENTRY (Notional/Fractional) ---
             else:
+                # Long entry using fractional notional
                 order = trading_client.submit_order(MarketOrderRequest(
                     symbol=ticker,
                     notional=round(target_value, 2),
@@ -121,7 +106,7 @@ async def tradingview_webhook(request: Request):
 async def health_check():
     return {"status": "ok"}
 
-
 if __name__ == "__main__":
     import uvicorn
+    # Optimized for Koyeb deployment
     uvicorn.run(app, host="0.0.0.0", port=8000)

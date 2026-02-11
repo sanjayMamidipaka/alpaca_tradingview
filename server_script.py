@@ -113,7 +113,6 @@ async def tradingview_webhook(request: Request):
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
-    print("Health check OK")
     return {"status": "ok"}
 
 if __name__ == "__main__":

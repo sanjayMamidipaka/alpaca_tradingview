@@ -48,15 +48,19 @@ async def tradingview_webhook(request: Request):
         if side_input in ["sell", "buy_to_cover"]:
             if current_position:
                 trading_client.close_position(ticker)
+                print(f"Closing position: {ticker}")
                 return {"status": "success", "message": f"Closed {ticker}"}
+            print("No position to close")
             return {"status": "ignored", "message": "No position to close"}
 
         # 3. Entry Logic (Volatility Washout Entry)
         elif side_input in ["buy", "sell_short"]:
             if current_position:
+                print("Position already open, ignoring")
                 return {"status": "ignored", "message": "Position already open"}
 
             if side_input == "sell_short" and is_crypto:
+                print("Crypto shorting not supported")
                 return {"status": "error", "message": "Crypto shorting not supported"}
 
             # Risk Calculation
@@ -67,17 +71,20 @@ async def tradingview_webhook(request: Request):
 
             # --- DATA FETCHING FIX ---
             # Using Snapshot to get the latest price for shorts or precise sizing
-            snapshot = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=[ticker]))
+            snapshot = data_client.get_stock_snapshot(
+                StockSnapshotRequest(symbol_or_symbols=[ticker]))
             current_price = snapshot[ticker].latest_trade.price
 
             if side_input == "sell_short":
                 asset_data = trading_client.get_asset(ticker)
                 if not asset_data.shortable:
+                    print(f"{ticker} not shortable")
                     return {"status": "error", "message": f"{ticker} not shortable"}
 
                 # Shorting requires whole shares in many Alpaca account types
                 share_qty = math.floor(target_value / current_price)
                 if share_qty < 1:
+                    print("Notional too low for 1 share")
                     return {"status": "error", "message": "Notional too low for 1 share"}
 
                 order = trading_client.submit_order(MarketOrderRequest(
@@ -95,15 +102,18 @@ async def tradingview_webhook(request: Request):
                     time_in_force=tif
                 ))
 
+            print(f"Order submitted: {order.id}")
             return {"status": "success", "order_id": str(order.id)}
 
     except Exception as e:
         print(f"ERROR: {str(e)}")
+        print(f"Returning error response: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
+    print("Health check OK")
     return {"status": "ok"}
 
 if __name__ == "__main__":

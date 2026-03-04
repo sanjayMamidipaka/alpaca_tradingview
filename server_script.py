@@ -81,6 +81,8 @@ async def tradingview_webhook(request: Request):
 
             # Calculate Quantity
             share_qty = math.floor(target_value / current_price)
+            market_value = share_qty * current_price
+            direction = "LONG" if side_input == "buy" else "SHORT"
 
             if side_input == "sell_short":
                 asset_data = trading_client.get_asset(ticker)
@@ -107,7 +109,9 @@ async def tradingview_webhook(request: Request):
                 ))
 
             print(
-                f"Order submitted: {order.id} for {share_qty} shares at approx ${current_price}")
+                f"Order submitted: ticker={ticker}, direction={direction}, qty={share_qty}, "
+                f"market_value={market_value:.2f}, approx_price={current_price:.4f}, order_id={order.id}"
+            )
             return {"status": "success", "order_id": str(order.id), "qty": share_qty}
 
     except Exception as e:

@@ -32,10 +32,15 @@ async def tradingview_webhook(request: Request):
     side_input = data.get("side", "").lower()
 
     # --- WEBHOOK PRICE INTEGRATION ---
-    # Get price from webhook; fallback to snapshot only if missing
+    # Get price from webhook; fallback to snapshot only for stocks
     webhook_price = data.get("price")
 
     is_crypto = ticker.endswith("USD") or ticker.endswith("USDT")
+
+    print(f"Incoming webhook data: {data}")
+    print(
+        f"Resolved ticker={ticker}, side={side_input}, is_crypto={is_crypto}, webhook_price={webhook_price}"
+    )
     tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
 
     try:
@@ -57,9 +62,11 @@ async def tradingview_webhook(request: Request):
         # 3. Entry Logic
         elif side_input in ["buy", "sell_short"]:
             if current_position:
+                print("Position already open, ignoring new entry signal")
                 return {"status": "ignored", "message": "Position already open"}
 
             if side_input == "sell_short" and is_crypto:
+                print("Crypto shorting not supported")
                 return {"status": "error", "message": "Crypto shorting not supported"}
 
             # Get Account Equity for Risk Management
@@ -68,16 +75,27 @@ async def tradingview_webhook(request: Request):
             target_value = max(risk_dollars, 11.00)
 
             # Determine Execution Price
-            if webhook_price:
+            # For crypto, we *require* a webhook price and avoid the stock snapshot API.
+            if webhook_price is not None:
                 current_price = float(webhook_price)
                 print(f"Using Webhook Price: {current_price}")
             else:
-                # Fallback to snapshot if the webhook price wasn't sent
+                if is_crypto:
+                    msg = (
+                        f"Webhook price missing for crypto {ticker}; "
+                        "cannot fall back to stock snapshot API"
+                    )
+                    print(msg)
+                    return {"status": "error", "message": msg}
+
+                # Fallback to snapshot only for stock symbols
                 snapshot = data_client.get_stock_snapshot(
-                    StockSnapshotRequest(symbol_or_symbols=[ticker]))
+                    StockSnapshotRequest(symbol_or_symbols=[ticker])
+                )
                 current_price = snapshot[ticker].latest_trade.price
                 print(
-                    f"Webhook price missing. Using Snapshot Price: {current_price}")
+                    f"Webhook price missing. Using Stock Snapshot Price: {current_price}"
+                )
 
             # Calculate Quantity
             share_qty = math.floor(target_value / current_price)
@@ -87,10 +105,15 @@ async def tradingview_webhook(request: Request):
             if side_input == "sell_short":
                 asset_data = trading_client.get_asset(ticker)
                 if not asset_data.shortable:
+                    print(f"{ticker} not shortable")
                     return {"status": "error", "message": f"{ticker} not shortable"}
 
                 if share_qty < 1:
-                    return {"status": "error", "message": "Notional too low for 1 share short"}
+                    print("Notional too low for 1 share short")
+                    return {
+                        "status": "error",
+                        "message": "Notional too low for 1 share short",
+                    }
 
                 order = trading_client.submit_order(MarketOrderRequest(
                     symbol=ticker,

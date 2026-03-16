@@ -3,8 +3,8 @@ import math
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from alpaca.trading.client import TradingClient
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockSnapshotRequest
+from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+from alpaca.data.requests import StockSnapshotRequest, CryptoSnapshotRequest
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.common.exceptions import APIError
@@ -20,6 +20,17 @@ PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE")
 # Initialize Clients
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+crypto_data_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
+
+
+def _crypto_symbol_for_data(ticker: str) -> str:
+    """Convert trading symbol (e.g. SOLUSD) to Alpaca crypto data format (SOL/USD)."""
+    ticker = ticker.upper()
+    if ticker.endswith("USDT"):
+        return f"{ticker[:-4]}/USDT"
+    if ticker.endswith("USD"):
+        return f"{ticker[:-3]}/USD"
+    return ticker
 
 
 @app.post("/webhook")
@@ -74,28 +85,58 @@ async def tradingview_webhook(request: Request):
             risk_dollars = float(account.equity) * 0.11
             target_value = max(risk_dollars, 11.00)
 
-            # Determine Execution Price
-            # For crypto, we *require* a webhook price and avoid the stock snapshot API.
+            # Determine Execution Price — guarantee we always get a price (webhook or Alpaca)
             if webhook_price is not None:
-                current_price = float(webhook_price)
-                print(f"Using Webhook Price: {current_price}")
-            else:
+                try:
+                    current_price = float(webhook_price)
+                    print(f"Using Webhook Price: {current_price}")
+                except (TypeError, ValueError):
+                    webhook_price = None
+            if webhook_price is None:
                 if is_crypto:
-                    msg = (
-                        f"Webhook price missing for crypto {ticker}; "
-                        "cannot fall back to stock snapshot API"
+                    # Guarantee crypto price via Alpaca crypto snapshot (e.g. SOLUSD -> SOL/USD)
+                    crypto_symbol = _crypto_symbol_for_data(ticker)
+                    try:
+                        snap = crypto_data_client.get_crypto_snapshot(
+                            CryptoSnapshotRequest(
+                                symbol_or_symbols=[crypto_symbol])
+                        )
+                        # SnapshotSet is dict-like: symbol -> Snapshot
+                        snapshot_data = None
+                        if hasattr(snap, "get"):
+                            snapshot_data = snap.get(
+                                crypto_symbol) or snap.get(ticker)
+                        if snapshot_data is None and hasattr(snap, "values"):
+                            for v in snap.values():
+                                snapshot_data = v
+                                break
+                        if snapshot_data is None:
+                            snapshot_data = snap
+                        if hasattr(snapshot_data, "latest_trade") and snapshot_data.latest_trade:
+                            current_price = float(
+                                snapshot_data.latest_trade.price)
+                        elif hasattr(snapshot_data, "latest_quote") and snapshot_data.latest_quote:
+                            q = snapshot_data.latest_quote
+                            ap, bp = float(q.ask_price), float(q.bid_price)
+                            current_price = (ap + bp) / \
+                                2.0 if (ap and bp) else ap or bp
+                        else:
+                            raise ValueError(
+                                f"No price in crypto snapshot for {crypto_symbol}")
+                        print(
+                            f"Crypto price from Alpaca snapshot ({crypto_symbol}): {current_price}")
+                    except Exception as e:
+                        print(
+                            f"Crypto snapshot failed for {ticker} ({crypto_symbol}): {e}")
+                        return {"status": "error", "message": f"Could not get crypto price for {ticker}: {e}"}
+                else:
+                    # Stock fallback
+                    snapshot = data_client.get_stock_snapshot(
+                        StockSnapshotRequest(symbol_or_symbols=[ticker])
                     )
-                    print(msg)
-                    return {"status": "error", "message": msg}
-
-                # Fallback to snapshot only for stock symbols
-                snapshot = data_client.get_stock_snapshot(
-                    StockSnapshotRequest(symbol_or_symbols=[ticker])
-                )
-                current_price = snapshot[ticker].latest_trade.price
-                print(
-                    f"Webhook price missing. Using Stock Snapshot Price: {current_price}"
-                )
+                    current_price = snapshot[ticker].latest_trade.price
+                    print(
+                        f"Webhook price missing. Using Stock Snapshot Price: {current_price}")
 
             # Calculate Quantity
             share_qty = math.floor(target_value / current_price)
